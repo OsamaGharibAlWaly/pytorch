@@ -33,6 +33,9 @@ struct TORCH_CUDA_CPP_API MemPool {
   MempoolId_t id();
   int use_count();
   c10::DeviceIndex device();
+  // The custom allocator backing this pool, or nullptr for the default one.
+  std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> allocator()
+      const;
   static MempoolId_t graph_pool_handle(bool is_user_created = true);
 
  private:
@@ -41,6 +44,7 @@ struct TORCH_CUDA_CPP_API MemPool {
   bool is_user_created_;
   MempoolId_t id_;
   c10::DeviceIndex device_;
+  std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> allocator_;
 };
 
 } // namespace at::cuda

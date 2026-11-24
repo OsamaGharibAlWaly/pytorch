@@ -20,7 +20,7 @@ MemPool::MemPool(
     bool is_user_created,
     bool use_on_oom,
     bool no_split)
-    : is_user_created_(is_user_created) {
+    : is_user_created_(is_user_created), allocator_(allocator) {
   if (is_user_created_) {
     id_ = {0, uid_++};
   } else {
@@ -58,6 +58,11 @@ int MemPool::use_count() {
 
 c10::DeviceIndex MemPool::device() {
   return device_;
+}
+
+std::shared_ptr<CUDACachingAllocator::CUDAAllocator> MemPool::allocator()
+    const {
+  return allocator_;
 }
 
 MempoolId_t MemPool::graph_pool_handle(bool is_user_created) {
