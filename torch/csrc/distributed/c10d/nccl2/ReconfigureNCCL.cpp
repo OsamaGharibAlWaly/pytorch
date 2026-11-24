@@ -480,7 +480,7 @@ c10::intrusive_ptr<::c10d::Work> ProcessGroupNCCL::reconfigure(
           "NCCL commRevoke failed during reconfigure");
     }
 
-    detachMemoryHook();
+    deregisterAllocatorSegments();
     retireComm();
     workq_.finalize();
 

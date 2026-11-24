@@ -19,11 +19,11 @@ class ProcessGroupNCCL;
 
 // One-sided window backed by NCCL 2.29+ RMA APIs (ncclPutSignal/ncclSignal/
 // ncclWaitSignal). Port of torchcomms' TorchCommWindowNCCL rebased onto
-// c10d::Window. Zero-copy: relies on the NCCL mempool hook
-// (NCCLCachingAllocatorHook + ProcessGroupNCCL::register_address) to register
-// every allocated segment. tensor_register / new_window collectively upgrades
-// the destination segment to a symmetric window. Source tensors passed to put
-// must already reside in a collectively registered symmetric segment.
+// c10d::Window. Zero-copy: relies on NCCLMemAllocator having registered the
+// tensor's segment with the process group. tensor_register / new_window
+// collectively upgrades the destination segment to a symmetric window. Source
+// tensors passed to put must already reside in a collectively registered
+// symmetric segment.
 //
 // signal() / wait_signal() use sigIdx=0, ctx=0 (the only values currently
 // accepted by NCCL). put() also emits a signal (ncclPutSignal cannot suppress

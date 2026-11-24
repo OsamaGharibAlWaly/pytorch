@@ -88,7 +88,7 @@ void WindowNCCL::tensor_register(const at::Tensor& tensor, bool owning) {
   TORCH_CHECK(tensor.is_contiguous(), "WindowNCCL: contiguous tensor required");
   c10::cuda::CUDAGuard device_guard(pg_->getDevice());
 
-  // Each segment from the NCCL mempool is tracked by the allocator hook.
+  // Segments of pools registered with this process group are tracked by it.
   // Register the underlying segment as a NCCL_WIN_COLL_SYMMETRIC window
   // (collective). All ranks must reach this point with matching segments --
   // which holds for symmetric allocation patterns (the standard usage).
@@ -118,9 +118,9 @@ void WindowNCCL::tensor_register(const at::Tensor& tensor, bool owning) {
 }
 
 void WindowNCCL::tensor_deregister() {
-  // Segment-level deregistration happens automatically when the mempool frees
-  // the segment (via NCCLCachingAllocatorHook). Here we just forget the
-  // tensor; the barriers keep ranks aligned around the collective contract.
+  // Segment-level deregistration happens when the pool frees the segment or is
+  // deregistered (NCCLMemAllocator). Here we just forget the tensor; the
+  // barriers keep ranks aligned around the collective contract.
   pg_->barrier();
   TORCH_CHECK(win_ != nullptr, "WindowNCCL: double deregistration");
   win_ = nullptr;

@@ -11,7 +11,7 @@
 #include <c10/util/hash.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
-#include <torch/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.hpp>
+#include <torch/csrc/distributed/c10d/nccl2/NCCLMemAllocator.hpp>
 #include <algorithm>
 #include <mutex>
 #include <optional>
@@ -659,53 +659,105 @@ void ProcessGroupNCCL::enableCollectivesTiming() {
   event_pool_->enableTiming();
 }
 
-void ProcessGroupNCCL::attachMemoryHook() {
-  NCCLCachingAllocatorHook::getInstance().registerComm(this);
+namespace {
+
+std::vector<std::shared_ptr<NCCLMemAllocator>> lockAllocators(
+    std::mutex& mutex,
+    const std::vector<std::weak_ptr<NCCLMemAllocator>>& allocators) {
+  std::lock_guard<std::mutex> lock(mutex);
+  std::vector<std::shared_ptr<NCCLMemAllocator>> live;
+  for (const auto& weak : allocators) {
+    if (auto allocator = weak.lock()) {
+      live.push_back(std::move(allocator));
+    }
+  }
+  return live;
 }
 
-void ProcessGroupNCCL::detachMemoryHook() {
-  NCCLCachingAllocatorHook::getInstance().deregisterComm(this);
+} // namespace
+
+void ProcessGroupNCCL::trackAllocator(
+    const std::shared_ptr<NCCLMemAllocator>& allocator) {
+  std::lock_guard<std::mutex> lock(allocators_mutex_);
+  std::erase_if(allocators_, [](const auto& weak) { return weak.expired(); });
+  if (std::ranges::none_of(allocators_, [&](const auto& weak) {
+        return weak.lock() == allocator;
+      })) {
+    allocators_.push_back(allocator);
+  }
 }
 
-void ProcessGroupNCCL::registerAddressLocked(void* addr, size_t len) {
-  void* handle = nullptr;
-  NCCL_CHECK(
-      nccl_api_,
-      nccl_comm_,
-      nccl_api_->commRegister(nccl_comm_, addr, len, &handle),
-      "Failed to register memory with NCCL");
-  // The collective NCCL_WIN_COLL_SYMMETRIC upgrade, if any, happens in
-  // ensureSymmetricWindow(), keyed by the base recorded here.
-  memoryRegistrationHandles_.emplace(
-      addr, RegistrationHandle{handle, nullptr, len});
+void ProcessGroupNCCL::registerAllocatorSegments() {
+  for (const auto& allocator : lockAllocators(allocators_mutex_, allocators_)) {
+    allocator->registerSegments(*this);
+  }
+}
+
+void ProcessGroupNCCL::deregisterAllocatorSegments() {
+  for (const auto& allocator : lockAllocators(allocators_mutex_, allocators_)) {
+    allocator->deregisterSegments(*this);
+  }
+}
+
+void ProcessGroupNCCL::detachAllocators() {
+  std::vector<std::weak_ptr<NCCLMemAllocator>> allocators;
+  {
+    std::lock_guard<std::mutex> lock(allocators_mutex_);
+    allocators.swap(allocators_);
+  }
+  for (const auto& weak : allocators) {
+    auto allocator = weak.lock();
+    if (!allocator) {
+      continue;
+    }
+    try {
+      allocator->detach(*this);
+    } catch (const std::exception& e) {
+      TC_LOG(ERROR, this) << "Failed to deregister MemPool segments: "
+                          << e.what();
+    }
+  }
 }
 
 void ProcessGroupNCCL::register_address(
     void* addr,
     size_t len,
-    const std::optional<c10::MempoolId_t>& pool) {
+    c10::DeviceIndex device,
+    bool symm) {
   if (nccl_comm_ == nullptr) {
     return;
   }
-  std::lock_guard<std::mutex> lock(memory_registration_mutex_);
   TORCH_CHECK(
-      !memoryRegistrationHandles_.count(addr),
-      "Memory already registered with NCCL");
-  registerAddressLocked(addr, len);
-  if (!pool) {
-    return;
+      device == device_.index(),
+      "Cannot register a MemPool segment on cuda:",
+      static_cast<int>(device),
+      " with a process group bound to ",
+      device_);
+  std::lock_guard<std::mutex> lock(memory_registration_mutex_);
+  auto it = memoryRegistrationHandles_.find(addr);
+  const bool fresh = it == memoryRegistrationHandles_.end();
+  if (fresh) {
+    void* handle = nullptr;
+    NCCL_CHECK(
+        nccl_api_,
+        nccl_comm_,
+        nccl_api_->commRegister(nccl_comm_, addr, len, &handle),
+        "Failed to register memory with NCCL");
+    it = memoryRegistrationHandles_
+             .emplace(addr, RegistrationHandle{handle, nullptr, len})
+             .first;
   }
-  // The hook passes every segment's owning pool (default pool, graph pools,
-  // pools registered on other PGs); unregistered pools keep plain registration.
-  auto it = registeredMemPools_.find(*pool);
-  if (it == registeredMemPools_.end()) {
-    return;
-  }
-  const auto& [id, symm] = *it;
   if (!symm) {
     return;
   }
-  auto rc = ensureSymmetricWindow(memoryRegistrationHandles_.find(addr));
+  auto rc = ensureSymmetricWindow(it);
+  if (rc != ncclSuccess && fresh) {
+    NCCL_CHECK_IGNORE(
+        nccl_api_,
+        nccl_api_->commDeregister(nccl_comm_, it->second.regHandle),
+        "ncclCommDeregister failed");
+    memoryRegistrationHandles_.erase(it);
+  }
   TORCH_CHECK(
       rc != ncclInvalidUsage,
       "Cannot register segment ",
@@ -721,41 +773,26 @@ void ProcessGroupNCCL::register_address(
       nccl_api_->getErrorString(rc));
 }
 
-void ProcessGroupNCCL::deregister_address(
-    void* addr,
-    bool from_allocator_hook) {
-  if (nccl_comm_ == nullptr) {
-    return;
-  }
+void ProcessGroupNCCL::deregister_address(void* addr) {
   std::lock_guard<std::mutex> lock(memory_registration_mutex_);
   auto it = memoryRegistrationHandles_.find(addr);
   if (it == memoryRegistrationHandles_.end()) {
     return;
   }
-  if (it->second.winHandle != nullptr) {
-    // Tearing the window down is still the least bad option -- the allocator is
-    // about to hand this address range back, and a later allocation reusing it
-    // would silently resolve to the stale window -- but say so loudly: on NCCL
-    // builds where ncclCommWindowDeregister barriers, a rank-divergent free
-    // hangs here, on an allocator thread, holding the allocator's mutex.
-    if (from_allocator_hook) {
-      TORCH_WARN_ONCE(
-          "A symmetric-window segment was freed without deregister_mem_pool() "
-          "being called first, so its NCCL window is being torn down from the "
-          "CUDA allocator hook. That is only safe if every rank frees the same "
-          "segment in the same order; call deregister_mem_pool() from every "
-          "rank before freeing.");
+  // Without a communicator the handles died with it; just forget them.
+  if (nccl_comm_ != nullptr) {
+    if (it->second.winHandle != nullptr) {
+      NCCL_CHECK_IGNORE(
+          nccl_api_,
+          nccl_api_->commWindowDeregister(nccl_comm_, it->second.winHandle),
+          "ncclCommWindowDeregister failed for segment");
     }
-    NCCL_CHECK_IGNORE(
+    NCCL_CHECK(
         nccl_api_,
-        nccl_api_->commWindowDeregister(nccl_comm_, it->second.winHandle),
-        "ncclCommWindowDeregister failed for segment");
+        nccl_comm_,
+        nccl_api_->commDeregister(nccl_comm_, it->second.regHandle),
+        "Failed to deregister memory with NCCL");
   }
-  NCCL_CHECK(
-      nccl_api_,
-      nccl_comm_,
-      nccl_api_->commDeregister(nccl_comm_, it->second.regHandle),
-      "Failed to deregister memory with NCCL");
   memoryRegistrationHandles_.erase(it);
 }
 
@@ -803,16 +840,6 @@ ncclResult_t ProcessGroupNCCL::ensureSegmentWindow(const void* ptr) {
 
 ncclResult_t ProcessGroupNCCL::ensureSymmetricWindow(
     RegistrationMap::iterator it) {
-#if defined(USE_ROCM)
-  // RCCL can create host-RMA windows for ordinary HIP allocations. Enforce the
-  // NCCL2 allocator contract for every path that creates a window. Return
-  // ncclInvalidArgument because registerMemPool reserves ncclInvalidUsage for
-  // unavailable transports and keeps those segments registered as plain
-  // buffers.
-  if (!isNcclAllocatorSegment(it->first, it->second.len)) {
-    return ncclInvalidArgument;
-  }
-#endif
   if (it->second.winHandle != nullptr) {
     return ncclSuccess;
   }
@@ -846,22 +873,6 @@ ncclResult_t ProcessGroupNCCL::ensureSymmetricWindow(
 
 namespace {
 
-// Segments currently backing `id`, in allocation order. Symmetric window
-// registration is collective, so every rank has to walk them in the same
-// order; registration_counter is the only cross-rank-stable ordering the
-// snapshot offers (this is what the stock backend sorts on too).
-std::vector<c10::cuda::CUDACachingAllocator::SegmentInfo> poolSegments(
-    const c10::cuda::MempoolId_t& id) {
-  auto snapshot = c10::cuda::CUDACachingAllocator::snapshot(id);
-  std::sort(
-      snapshot.segments.begin(),
-      snapshot.segments.end(),
-      [](const auto& a, const auto& b) {
-        return a.registration_counter < b.registration_counter;
-      });
-  return std::move(snapshot.segments);
-}
-
 constexpr const char* kUninitializedCommError =
     "NCCL communicator has not been initialized before mem pool creation. You can pass `device_id` to init_process_group -- one way of eager initialization -- to work around this issue";
 
@@ -877,101 +888,34 @@ void ProcessGroupNCCL::registerMemPool(at::cuda::MemPool* pool, bool symm) {
       static_cast<int>(pool->device()),
       " but this process group is bound to ",
       device_);
+  auto allocator =
+      std::dynamic_pointer_cast<NCCLMemAllocator>(pool->allocator());
+  TORCH_CHECK(
+      allocator,
+      "register_mem_pool requires a MemPool created with an NCCL backend "
+      "allocator: torch.cuda.MemPool(backend.mem_allocator)");
   TC_LOG(INFO, this) << "Registering MemPool " << pool->id().first << ":"
                      << pool->id().second << " (symm=" << symm << ") on "
                      << device_;
-  // One snapshot for both the ROCm provenance pre-check and the registration
-  // loop: taking it twice would let a concurrent allocation change the segment
-  // set between validation and use.
-  const auto segments = poolSegments(pool->id());
-#if defined(USE_ROCM)
-  if (symm) {
-    // RCCL can window-register ordinary HIP allocations, but the NCCL2
-    // symmetric contract requires ncclMemAlloc provenance. Reject up front,
-    // before any state mutation, so a rejected pool never lands in
-    // registeredMemPools_ or leaves plain registrations behind.
-    for (const auto& segment : segments) {
-      // NOLINTNEXTLINE(performance-no-int-to-ptr)
-      void* addr = reinterpret_cast<void*>(segment.address);
-      TORCH_CHECK(
-          isNcclAllocatorSegment(addr, segment.total_size),
-          "register_mem_pool(symm=True) on ROCm requires a MemPool created "
-          "with the NCCL backend allocator: MemPool(backend.mem_allocator). "
-          "Segment ",
-          addr,
-          " was not allocated by ncclMemAlloc.");
-    }
-  }
-#endif
-  {
-    std::lock_guard<std::mutex> lock(memory_registration_mutex_);
-    auto [it, inserted] = registeredMemPools_.try_emplace(pool->id(), symm);
-    TORCH_CHECK(
-        inserted || it->second == symm,
-        "MemPool is already registered with symm=",
-        it->second ? "True" : "False",
-        "; call deregister_mem_pool before registering it with symm=",
-        symm ? "True" : "False");
-  }
-  bool symmUnsupported = false;
-  for (const auto& segment : segments) {
-    // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    void* addr = reinterpret_cast<void*>(segment.address);
-    {
-      std::lock_guard<std::mutex> lock(memory_registration_mutex_);
-      // The allocator hook normally registered this segment already; only the
-      // ones it could not reach (allocated while the comm was down, or
-      // deregistered by an earlier deregisterMemPool) are left to do here.
-      if (!memoryRegistrationHandles_.count(addr)) {
-        registerAddressLocked(addr, segment.total_size);
-      }
-    }
-    if (!symm) {
-      continue;
-    }
-    // Segments allocated after this point are upgraded by register_address
-    // from the allocator hook.
-    auto rc = ensureSegmentWindow(addr);
-    if (rc == ncclInvalidUsage) {
-      // No symmetric-memory-capable transport (or NCCL predates
-      // ncclCommWindowRegister). The stock backend keeps the plain
-      // registration and reports success here; do the same, but say so.
-      symmUnsupported = true;
-      continue;
-    }
-    TORCH_CHECK(
-        rc == ncclSuccess,
-        "Failed to register segment ",
-        addr,
-        " as an NCCL symmetric window: ",
-        nccl_api_->getErrorString(rc));
-  }
-  if (symmUnsupported) {
-    TC_LOG(WARNING, this)
-        << "Symmetric (NVLS) registration unavailable for MemPool "
-        << pool->id().first << ":" << pool->id().second
-        << "; its buffers stay registered as plain NCCL user buffers.";
-  }
+  allocator->attach(*this, symm);
+  trackAllocator(allocator);
 }
 
 void ProcessGroupNCCL::deregisterMemPool(at::cuda::MemPool* pool) {
   if (nccl_comm_ == nullptr) {
     C10_THROW_ERROR(DistBackendError, kUninitializedCommError);
   }
-  {
-    std::lock_guard<std::mutex> lock(memory_registration_mutex_);
-    TORCH_CHECK(
-        registeredMemPools_.erase(pool->id()) == 1,
-        "Trying to unregister not previously registered pool");
-  }
   TC_LOG(INFO, this) << "Deregistering MemPool " << pool->id().first << ":"
                      << pool->id().second << " on " << device_;
-  for (const auto& segment : poolSegments(pool->id())) {
-    // deregister_address tears the symmetric window down before the plain
-    // registration and tolerates a segment that is not registered.
-    // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    deregister_address(reinterpret_cast<void*>(segment.address));
-  }
+  auto allocator =
+      std::dynamic_pointer_cast<NCCLMemAllocator>(pool->allocator());
+  TORCH_CHECK(
+      allocator && allocator->detach(*this),
+      "Trying to unregister not previously registered pool");
+  std::lock_guard<std::mutex> lock(allocators_mutex_);
+  std::erase_if(allocators_, [&](const auto& weak) {
+    return weak.expired() || weak.lock() == allocator;
+  });
 }
 
 } // namespace c10d::nccl2

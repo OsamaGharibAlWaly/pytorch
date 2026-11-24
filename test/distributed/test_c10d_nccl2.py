@@ -2012,8 +2012,24 @@ class ProcessGroupNCCL2MemPoolTest(MultiProcContinuousTest):
         with torch.cuda.use_mem_pool(pool):
             return torch.full((numel,), float(self.rank), device=self.device)
 
+    def _skip_unless_symmetric(self, backend) -> None:
+        # symm=True raises without a transport that supports symmetric memory
+        # (e.g. PCIe-only GPUs). Every rank fails together, so all skip.
+        pool = torch.cuda.MemPool(backend.mem_allocator)
+        backend.register_mem_pool(pool, symm=True)
+        try:
+            self._pool_tensor(pool)
+        except RuntimeError as e:
+            if "does not support symmetric" not in str(e):
+                raise
+            self.skipTest(f"symmetric memory unsupported: {e}")
+        finally:
+            backend.deregister_mem_pool(pool)
+
     def _check_all_reduce_over_pool(self, symm: bool) -> None:
         backend = self._backend()
+        if symm:
+            self._skip_unless_symmetric(backend)
         pool = torch.cuda.MemPool(backend.mem_allocator)
         tensor = self._pool_tensor(pool)
         backend.register_mem_pool(pool, symm=symm)
@@ -2035,20 +2051,13 @@ class ProcessGroupNCCL2MemPoolTest(MultiProcContinuousTest):
         self._check_all_reduce_over_pool(symm=True)
 
     @requires_nccl()
-    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only contract")
     @skip_if_lt_x_gpu(2)
-    def test_register_mem_pool_symmetric_rejects_unrelated_allocator(
-        self,
-    ) -> None:
+    def test_register_mem_pool_rejects_foreign_allocator(self) -> None:
         backend = self._backend()
         pool = torch.cuda.MemPool()
         tensor = self._pool_tensor(pool)
-        # register_mem_pool validates provenance before touching any state, so a
-        # rejected pool is never recorded.
-        with self.assertRaisesRegex(RuntimeError, "mem_allocator|ncclMemAlloc"):
+        with self.assertRaisesRegex(RuntimeError, "mem_allocator"):
             backend.register_mem_pool(pool, symm=True)
-        # Guard the no-leftover-state contract: a revert to insert-then-throw
-        # would leave the pool registered and this deregister would succeed.
         with self.assertRaisesRegex(RuntimeError, "not previously registered"):
             backend.deregister_mem_pool(pool)
         del tensor
@@ -2057,10 +2066,10 @@ class ProcessGroupNCCL2MemPoolTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     def test_register_mem_pool_round_trip(self) -> None:
         # Megatron re-enters its allocator context once per bucket: deregister,
-        # grow the pool, register again. Neither leg may trip over a segment
-        # the caching-allocator hook already registered, and the second
-        # register has to pick up segments the hook never saw (reused ones).
+        # grow the pool, register again. The second register has to pick up the
+        # segment allocated while the pool was deregistered.
         backend = self._backend()
+        self._skip_unless_symmetric(backend)
         pool = torch.cuda.MemPool(backend.mem_allocator)
         first = self._pool_tensor(pool)
         backend.register_mem_pool(pool, symm=True)
@@ -2080,7 +2089,9 @@ class ProcessGroupNCCL2MemPoolTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     def test_deregister_unregistered_mem_pool_raises(self) -> None:
         backend = self._backend()
+        # Registered with backend on creation.
         pool = torch.cuda.MemPool(backend.mem_allocator)
+        backend.deregister_mem_pool(pool)
         with self.assertRaisesRegex(RuntimeError, "not previously registered"):
             backend.deregister_mem_pool(pool)
 
@@ -2089,13 +2100,59 @@ class ProcessGroupNCCL2MemPoolTest(MultiProcContinuousTest):
     def test_register_mem_pool_conflicting_symm_raises(self) -> None:
         backend = self._backend()
         pool = torch.cuda.MemPool(backend.mem_allocator)
-        backend.register_mem_pool(pool, symm=False)
         try:
+            # Already registered without symm; upgrading the empty pool to symm
+            # is allowed, downgrading it is not.
             backend.register_mem_pool(pool, symm=False)
+            backend.register_mem_pool(pool, symm=True)
+            backend.register_mem_pool(pool, symm=True)
             with self.assertRaisesRegex(RuntimeError, "already registered with symm"):
-                backend.register_mem_pool(pool, symm=True)
+                backend.register_mem_pool(pool, symm=False)
         finally:
             backend.deregister_mem_pool(pool)
+
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
+    def test_mem_pool_registered_with_other_group(self) -> None:
+        backend = self._backend()
+        self._skip_unless_symmetric(backend)
+        group = dist.new_group(device_id=self.device)
+        try:
+            other = dist.get_backend_impl(group, self.device)
+            pool = torch.cuda.MemPool(other.mem_allocator)
+            tensor = self._pool_tensor(pool)
+            backend.register_mem_pool(pool, symm=True)
+            try:
+                for pg in (None, group):
+                    tensor.fill_(float(self.rank))
+                    dist.all_reduce(tensor, group=pg)
+                    torch.cuda.synchronize()
+                    expected = torch.full_like(tensor, self._all_reduced)
+                    self.assertEqual(tensor, expected)
+            finally:
+                backend.deregister_mem_pool(pool)
+            del tensor, pool
+        finally:
+            dist.destroy_process_group(group)
+
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
+    def test_mem_pool_outlives_process_group(self) -> None:
+        group = dist.new_group(device_id=self.device)
+        backend = dist.get_backend_impl(group, self.device)
+        pool = torch.cuda.MemPool(backend.mem_allocator)
+        tensor = self._pool_tensor(pool)
+        dist.all_reduce(tensor, group=group)
+        torch.cuda.synchronize()
+        # Tearing down the group deregisters its segments. Freeing them later
+        # must not reach the destroyed process group.
+        dist.destroy_process_group(group)
+        del backend, group
+        gc.collect()
+        self.assertEqual(tensor, torch.full_like(tensor, self._all_reduced))
+        del tensor, pool
+        # The pool's segments are gone; a new pool on the default group works.
+        self._check_all_reduce_over_pool(symm=False)
 
 
 class ProcessGroupNCCLLazyMemPoolTest(ProcessGroupNCCL2MemPoolTest):
@@ -2106,11 +2163,10 @@ class ProcessGroupNCCLLazyMemPoolTest(ProcessGroupNCCL2MemPoolTest):
     @requires_nccl()
     @skip_if_lt_x_gpu(2)
     def test_register_mem_pool_with_pair_comms(self) -> None:
-        # Once a pair comm exists the allocator hook registers new pool segments
-        # with it too; only the primary holds the pool registration. Allocating
-        # before register_mem_pool lets symm=True warn instead of raising when
-        # symmetric memory is unsupported.
+        # Only the primary holds the pool registration; point-to-point on the
+        # pair comms must still work on pool tensors.
         backend = self._backend()
+        self._skip_unless_symmetric(backend)
         nxt = (self.rank + 1) % self.world_size
         prev = (self.rank - 1) % self.world_size
 

@@ -47,6 +47,8 @@
 
 namespace c10d::nccl2 {
 
+class NCCLMemAllocator;
+
 // Hint key names for NCCL backend configuration
 constexpr std::string_view kHintMaxEventPoolSize = "max_event_pool_size";
 constexpr size_t kDefaultMaxEventPoolSize = 1000;
@@ -275,6 +277,8 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       const c10::intrusive_ptr<::c10d::Backend::Options>& opts_override =
           nullptr) override;
 
+  // Returns a new NCCLMemAllocator, registered with this process group. Use one
+  // per MemPool.
   std::shared_ptr<c10::Allocator> getMemAllocator() override;
   at::Tensor allocateTensor(long size, at::TensorOptions options) override;
   bool supportsTensorAlloc(c10::DeviceIndex deviceIdx) override;
@@ -316,53 +320,40 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       const ::c10d::ReconfigureOptions& opts) override;
 
   // Window / one-sided RMA API (see Backend.hpp and WindowNCCL.hpp). Windows
-  // are zero-copy: tensors must be allocated from this backend's NCCL mempool
-  // (torch.cuda.MemPool(backend.mem_allocator)); the caching-allocator hook
-  // registers each mempool segment with the communicator and WindowNCCL
-  // lazily upgrades the segment to a collective NCCL_WIN_COLL_SYMMETRIC
-  // window on first use. Requires NCCL 2.29+ at runtime.
+  // are zero-copy: tensors must be allocated from a pool registered with this
+  // process group (torch.cuda.MemPool(backend.mem_allocator)), and WindowNCCL
+  // lazily upgrades the segment to a collective NCCL_WIN_COLL_SYMMETRIC window
+  // on first use. Requires NCCL 2.29+ at runtime.
   bool supportsWindow() const override;
   c10::intrusive_ptr<::c10d::Window> new_window(
       const std::optional<at::Tensor>& tensor = std::nullopt) override;
 
   // MemPool registration (::c10d::ProcessGroupNCCL::registerMemPool parity).
-  // Unlike the stock backend, plain ncclCommRegister of every private-pool
-  // segment already happens unconditionally through NCCLCachingAllocatorHook,
-  // so this only has to cover the segments the hook could not reach and -- for
-  // symm -- upgrade the pool's existing segments to collective
-  // NCCL_WIN_COLL_SYMMETRIC windows. Segments the pool allocates afterwards are
-  // upgraded by register_address. Collective when symm is set: every rank must
-  // call it with the same pool contents, in the same order.
+  // The pool must be backed by an NCCLMemAllocator, which registers its
+  // segments with every attached process group. registerMemPool attaches this
+  // one (a pool from its own getMemAllocator() already is) or upgrades the
+  // attachment to symm. Collective when symm is set: every rank must call it
+  // with the same pool contents, in the same order.
   void registerMemPool(at::cuda::MemPool* pool, bool symm = false);
   void deregisterMemPool(at::cuda::MemPool* pool);
 
-  // Caching-allocator segment registration (called by
-  // NCCLCachingAllocatorHook, potentially from allocator threads). `pool` is
-  // the segment's owning pool, passed only for a fresh SEGMENT_ALLOC: if it was
-  // registered with symm=True the segment is also window-registered, which is
-  // collective, so every rank must allocate the pool's segments in the same
-  // order (the same contract as the stock backend).
+  // Called by NCCLMemAllocator with its mutex held, potentially from allocator
+  // threads. register_address is idempotent and a no-op without a
+  // communicator; with symm it also window-registers the segment, which is
+  // collective.
   void register_address(
       void* addr,
       size_t len,
-      const std::optional<c10::MempoolId_t>& pool = std::nullopt);
-  // from_allocator_hook only controls diagnostics: tearing a symmetric window
-  // down from the hook is the uncollective path worth warning about.
-  void deregister_address(void* addr, bool from_allocator_hook = false);
+      c10::DeviceIndex device,
+      bool symm);
+  void deregister_address(void* addr);
   // Returns {window handle, byte offset of ptr within the segment}, or
   // {nullptr, 0} if ptr is not inside a window-registered segment.
   std::pair<ncclWindow_t, size_t> lookupSegmentWindow(const void* ptr);
-#if defined(USE_ROCM)
-  // Returns true when ptr exactly matches an ncclMemAlloc segment base on this
-  // process group's device and len does not exceed the allocation size.
-  bool isNcclAllocatorSegment(const void* ptr, size_t len) const;
-#endif
   // Registers the segment containing ptr as a NCCL_WIN_COLL_SYMMETRIC window
   // if it is not one already. Collective: all ranks must call it together.
-  // On ROCm the segment must be a live ncclMemAlloc/getMemAllocator range:
-  // an ineligible segment returns ncclInvalidArgument (caller should throw),
-  // while ncclInvalidUsage stays reserved for a missing symmetric transport
-  // (caller keeps the plain registration and warns).
+  // Returns ncclInvalidArgument if ptr is not in a registered segment and
+  // ncclInvalidUsage if no transport supports symmetric memory.
   ncclResult_t ensureSegmentWindow(const void* ptr);
 
   bool supportsAbortHooks() const override {
@@ -653,8 +644,15 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       uint64_t completion_key,
       std::optional<float> duration_ms);
 
-  void attachMemoryHook();
-  void detachMemoryHook();
+  // Track an allocator this process group is attached to, so the communicator
+  // lifecycle reaches it.
+  void trackAllocator(const std::shared_ptr<NCCLMemAllocator>& allocator);
+  // (De)register the attached allocators' segments with nccl_comm_ as it is
+  // created or torn down.
+  void registerAllocatorSegments();
+  void deregisterAllocatorSegments();
+  // Detach from every allocator. Must run before this object is destroyed.
+  void detachAllocators();
 
   // Publish/retire nccl_comm_ to the symmetric-memory registry via the NCCL
   // comm-registration hook (NCCLCommRegistrationHook.hpp), so this class does
@@ -719,7 +717,7 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   const uint64_t reconfigure_instance_id_{
       c10::detail::getNonDeterministicRandom()};
 
-  // Registration handle for a caching-allocator segment (and its symmetric
+  // Registration handle for an NCCLMemAllocator segment (and its symmetric
   // window, once ensureSegmentWindow upgraded it). Sorted by base address so
   // lookupSegmentWindow can find the containing segment via upper_bound.
   struct RegistrationHandle {
@@ -735,18 +733,13 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   // ensureSegmentWindow for a known registration; caller must hold
   // memory_registration_mutex_.
   ncclResult_t ensureSymmetricWindow(RegistrationMap::iterator it);
-  // Guards memoryRegistrationHandles_ and registeredMemPools_:
-  // register/deregister_address run on allocator threads while window ops look
-  // segments up on the main thread.
+  // Guards memoryRegistrationHandles_: register/deregister_address run on
+  // allocator threads while window ops look segments up on the main thread.
   std::mutex memory_registration_mutex_;
-  // MemPools passed to registerMemPool -> whether any registration asked for
-  // symm. deregisterMemPool uses it to reject a pool that was never registered
-  // (stock does the same via its global ncclCommMemPoolMap); register_address
-  // uses the symm flag to window-register segments the pool allocates later.
-  std::map<c10::cuda::MempoolId_t, bool> registeredMemPools_;
-  // Caller must hold memory_registration_mutex_ and have checked that `addr`
-  // is not already registered.
-  void registerAddressLocked(void* addr, size_t len);
+  // Allocators this process group is attached to, in attach order (the
+  // cross-rank order for collective window registration).
+  std::vector<std::weak_ptr<NCCLMemAllocator>> allocators_;
+  std::mutex allocators_mutex_;
 
   // Abort hooks (c10d::Backend API; storage was in torchcomms' TorchCommBackend
   // base, folded in here). Guarded because the watchdog thread fires them while

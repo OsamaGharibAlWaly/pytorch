@@ -218,7 +218,7 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
     // the destructor (abortNcclComm() throws on a failed or timed-out abort).
     if (nccl_comm_) {
       // Drop our symmetric-memory registration while nccl_comm_ is still valid
-      // (it is nulled below, before detachMemoryHook runs).
+      // (it is nulled below).
       retireComm();
       // Best effort to abort the communicator - ignore errors since we're
       // in the destructor
@@ -238,9 +238,9 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
     }
   }
 
-  // We need to detach the memory hook in case finalize is not called,
-  // so that we don't encounter a memory corruption.
-  detachMemoryHook();
+  // MemPool allocators hold a raw pointer to this object; finalize() may not
+  // have run.
+  detachAllocators();
 }
 
 void ProcessGroupNCCL::init(at::Device device) {
@@ -342,7 +342,7 @@ void ProcessGroupNCCL::initNcclResources() {
     timeout_thread_ = std::thread(&ProcessGroupNCCL::timeoutWatchdog, this);
   }
 
-  attachMemoryHook();
+  registerAllocatorSegments();
   publishComm();
 }
 
@@ -622,14 +622,7 @@ void ProcessGroupNCCL::finalize() {
     throw std::move(ncclException);
   }
 
-  if (memPool_) {
-    try {
-      deregisterMemPool(memPool_.get());
-    } catch (const std::exception& error) {
-      TC_LOG(ERROR, this) << "Failed to deregister tensor allocation pool: "
-                          << error.what();
-    }
-  }
+  detachAllocators();
 
   event_pool_->clear();
 
@@ -642,9 +635,7 @@ void ProcessGroupNCCL::finalize() {
   // Note: If abortNcclComm() was called, nccl_comm_ is already nullptr and this
   // is skipped. We must not call commDestroy after commAbort per NCCL docs.
   if (nccl_comm_) {
-    detachMemoryHook();
     retireComm();
-    // Deregister comm from the CachingAllocator
     waitForNcclCompletion(
         *nccl_api_,
         nccl_comm_,
@@ -656,7 +647,7 @@ void ProcessGroupNCCL::finalize() {
 }
 
 void ProcessGroupNCCL::abortNcclComm() {
-  detachMemoryHook();
+  deregisterAllocatorSegments();
   retireComm();
   if (nccl_comm_) {
     waitForNcclCompletion(
@@ -752,15 +743,15 @@ void ProcessGroupNCCL::handleBlockingWaitFailure(
 void ProcessGroupNCCL::revokeNcclComm() {
   // Idempotent: the timeout watchdog and a synchronous collective may both
   // observe the same timeout and attempt a revoke. Run the teardown (abort
-  // hooks, memory hook detach, commRevoke) at most once per communicator
-  // generation. revoked_ is reset on reconfigure.
+  // hooks, MemPool segment deregistration, commRevoke) at most once per
+  // communicator generation. revoked_ is reset on reconfigure.
   std::lock_guard revokeLock(revoke_mutex_);
   if (revoked_.exchange(true)) {
     return;
   }
   TC_LOG(INFO, this) << "Calling abort hooks before commRevoke.";
   runAbortHooks();
-  detachMemoryHook();
+  deregisterAllocatorSegments();
   retireComm();
   if (nccl_comm_) {
     try {

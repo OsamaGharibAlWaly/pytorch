@@ -521,7 +521,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             # mem_allocator and allocate_tensor require NCCL >= 2.19 and GPU
             # multicast support (e.g., not available on T4)
             if wrapper.supports_tensor_alloc(device):
-                self.assertIs(wrapper.mem_allocator, unwrapped.mem_allocator)
+                # nccl2 returns a new allocator per call.
+                allocator_type = type(unwrapped.mem_allocator)
+                self.assertIs(type(wrapper.mem_allocator), allocator_type)
                 tensor = wrapper.allocate_tensor(
                     1024, dtype=torch.float32, device=device
                 )
