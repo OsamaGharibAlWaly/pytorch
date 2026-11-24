@@ -928,7 +928,10 @@ print(tensor[0:4])
 
 Note the usage of `register_mem_pool` in the above example. This is an extra step for
 NVLS reductions, where the user buffers need to be registered with NCCL. A user can
-de-register the buffers with a similar `deregister_mem_pool` call.
+de-register the buffers with a similar `deregister_mem_pool` call. With the default
+`nccl` backend, a pool created from `backend.mem_allocator` is already registered with
+`backend`, so the call above is a no-op. That backend's `register_mem_pool` only accepts
+pools created from a `backend.mem_allocator`, not from a custom `CUDAPluggableAllocator`.
 
 To reclaim memory, users will first need to ensure nothing is using the pool. When none
 of the tensors are holding a reference to the pool, {meth}`~torch.cuda.empty_cache` will

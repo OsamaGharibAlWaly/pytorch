@@ -391,7 +391,8 @@ pg = dist.group.WORLD
 
 backend = dist.get_backend_impl(pg, device)
 
-# A MemPool backed by `ncclMemAlloc` / `ncclMemFree`.
+# A MemPool backed by `ncclMemAlloc` / `ncclMemFree`. Use a new
+# `backend.mem_allocator` for each pool.
 pool = torch.cuda.MemPool(backend.mem_allocator)
 
 # `symm=True` registers each segment with `ncclCommWindowRegister` using
@@ -410,8 +411,15 @@ dist.all_reduce(x, op=dist.ReduceOp.SUM)
 backend.deregister_mem_pool(pool)
 ```
 
-`register_mem_pool` registers the segments already in the pool *and* installs an
-allocator hook, so later allocations in the pool are registered as well.
+`register_mem_pool` registers the segments already in the pool, and later
+allocations in the pool are registered as well. With the default `nccl`
+backend, the pool's allocator does the registering: a pool from
+`backend.mem_allocator` is already registered with `backend` without
+`symm`, and `register_mem_pool` accepts only pools created this way. To use the
+pool with another process group, call `register_mem_pool` on that group's
+backend too. Segments are deregistered when the pool frees them. Call
+`deregister_mem_pool` on every rank before freeing a `symm=True` pool, because
+tearing down symmetric windows is collective.
 
 ### Option 2: allocate through the NCCL symmetric memory backend
 

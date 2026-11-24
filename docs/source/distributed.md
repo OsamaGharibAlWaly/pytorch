@@ -638,8 +638,8 @@ With `nccl` and `nccl-lazy`:
   the pool after the call is a valid source. Each new segment is then
   registered collectively, so all ranks must allocate the same sizes in the
   same order, and allocation raises if no transport supports symmetric memory.
-  Segments that already exist are upgraded too, but without such a transport
-  they only log a warning and are not valid sources.
+  Segments that already exist are upgraded too, and without such a transport
+  `register_mem_pool` raises.
 - **Registration.** A window holds one tensor at a time; call
   {meth}`~torch.distributed.distributed_c10d.Window.tensor_deregister` before registering another.
   {func}`~torch.distributed.distributed_c10d._new_window` with a tensor
@@ -649,8 +649,7 @@ With `nccl` and `nccl-lazy`:
 - **Teardown.** {meth}`~torch.distributed.distributed_c10d.Window.tensor_deregister` only drops the window's
   bookkeeping; the segment stays registered with NCCL until the allocator
   frees it, and every rank must free its segments in the same order or
-  teardown can hang. To avoid this, register the pool with
-  `backend.register_mem_pool` (either `symm` value) and tear down in this order on every rank:
+  teardown can hang. To avoid this, tear down in this order on every rank:
   synchronize outstanding window work, call `tensor_deregister` on every
   window backed by the pool, call `backend.deregister_mem_pool(pool)`, free
   the tensors and pool, then call
