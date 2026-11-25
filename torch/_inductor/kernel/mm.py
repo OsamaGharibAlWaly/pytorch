@@ -1101,7 +1101,9 @@ def tuned_addmm(inp, mat1, mat2, out_dtype=None, *, alpha=1, beta=1, layout=None
             input_reorder=[2, 0, 1],
         )
 
-    if is_nonzero and use_nv_universal_gemm_template(layout, m, n, k, mat1, mat2):
+    if is_nonzero and use_nv_universal_gemm_template(
+        layout, m, n, k, mat1, mat2, allow_symbolic_shapes=True
+    ):
         from ..codegen.nv_universal_gemm import add_nv_universal_addmm_choices
 
         # inp is the original (un-expanded) bias, so a 1D row vector routes to
@@ -1908,7 +1910,9 @@ def tuned_scaled_mm_v2(
     )
 
     # NVGEMM get_kernels() will return empty if the scaling mode/dtype is unsupported
-    if is_nonzero and use_nv_universal_gemm_template(layout, m, n, k, mat_a, mat_b):
+    if is_nonzero and use_nv_universal_gemm_template(
+        layout, m, n, k, mat_a, mat_b, allow_symbolic_shapes=True
+    ):
         from ..codegen.nv_universal_gemm import add_nv_universal_scaled_gemm_choices
 
         add_nv_universal_scaled_gemm_choices(
@@ -2037,7 +2041,9 @@ def tuned_scaled_mm(
         folded_output_scale_real is not None
         and is_nonzero
         and _use_autotune_backend("NVGEMM")
-        and use_nv_universal_gemm_template(layout, m, n, k, mat_a, mat_b)
+        and use_nv_universal_gemm_template(
+            layout, m, n, k, mat_a, mat_b, allow_symbolic_shapes=True
+        )
     ):
         from ..codegen.nv_universal_gemm import (
             add_nv_universal_scaled_gemm_choices,
@@ -2161,7 +2167,9 @@ def tuned_scaled_mm(
     )
 
     # NVGEMM get_kernels() will return empty if the scaling mode/dtype is unsupported
-    if is_nonzero and use_nv_universal_gemm_template(layout, m, n, k, mat_a, mat_b):
+    if is_nonzero and use_nv_universal_gemm_template(
+        layout, m, n, k, mat_a, mat_b, allow_symbolic_shapes=True
+    ):
         from ..codegen.nv_universal_gemm import add_nv_universal_scaled_gemm_choices
 
         add_nv_universal_scaled_gemm_choices(
