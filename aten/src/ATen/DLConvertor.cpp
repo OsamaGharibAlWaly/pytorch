@@ -1,4 +1,5 @@
 #include <ATen/DLConvertor.h>
+#include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <memory>
 
 using namespace std;
@@ -144,6 +145,9 @@ DLDevice torchDeviceToDLDevice(at::Device device) {
       ctx.device_type = DLDeviceType::kDLMAIA;
       break;
     case DeviceType::PrivateUse1:
+      if (isPrivateUse1HooksRegistered()) {
+        return detail::getPrivateUse1Hooks().getDLDevice(device.index());
+      }
       ctx.device_type = DLDeviceType::kDLExtDev;
       break;
     case DeviceType::MTIA:

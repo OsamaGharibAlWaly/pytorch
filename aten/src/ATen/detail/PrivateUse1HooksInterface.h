@@ -2,6 +2,7 @@
 
 #include <ATen/core/GeneratorForPrivateuseone.h>
 #include <ATen/detail/AcceleratorHooksInterface.h>
+#include <ATen/dlpack.h>
 
 #include <c10/core/Allocator.h>
 #include <c10/core/Device.h>
@@ -65,6 +66,14 @@ struct TORCH_API PrivateUse1HooksInterface : AcceleratorHooksInterface {
       const c10::Storage& /*storage*/,
       size_t /*newsize*/) const {
     FAIL_PRIVATEUSE1HOOKS_FUNC(__func__);
+  }
+
+  // Used by DLPack exports and device queries. Backends can override both the
+  // device type and index, e.g. return {kDLCUDAManaged, 0} for managed memory.
+  virtual DLDevice getDLDevice(DeviceIndex device_index) const {
+    return {
+        kDLExtDev,
+        static_cast<int32_t>(static_cast<unsigned char>(device_index))};
   }
 
 #undef FAIL_PRIVATEUSE1HOOKS_FUNC
