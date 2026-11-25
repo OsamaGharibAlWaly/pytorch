@@ -6640,6 +6640,11 @@ class TestNVUniversalGemmShapeConstraints(TestCase):
     "Requires cutlass.operators and Blackwell",
 )
 class TestNVUniversalGemmDynamicOperators(TestCase):
+    def _run_and_check_nvgemm(self, compiled, *args):
+        result, code = run_and_get_code(compiled, *args)
+        self.assertIn("_nvgemm_run(", "\n".join(code))
+        return result
+
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     @parametrize("aligned", (False, True))
     def test_unbacked_alignment(self, device, aligned):
@@ -6664,7 +6669,7 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
                 if aligned:
                     if value == 2:
                         result, code = run_and_get_code(compiled, count, a, b)
-                        self.assertIn("nv_universal_gemm", "\n".join(code))
+                        self.assertIn("_nvgemm_run(", "\n".join(code))
                     else:
                         result = compiled(count, a, b)
                     self.assertEqual(result, fn(count, a, b))
@@ -6684,13 +6689,19 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         counters.clear()
 
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled_fn = torch.compile(addmm, dynamic=True)
-            for m, n, k in ((64, 128, 256), (128, 256, 512), (64, 128, 256)):
+            compiled_fn = torch.compile(addmm, dynamic=True, fullgraph=True)
+            shapes = ((64, 128, 256), (128, 256, 512), (64, 128, 256))
+            for index, (m, n, k) in enumerate(shapes):
                 bias = torch.randn(n, dtype=torch.bfloat16, device=device)
                 a = torch.randn(m, k, dtype=torch.bfloat16, device=device)
                 b = torch.randn(k, n, dtype=torch.bfloat16, device=device)
+                actual = (
+                    self._run_and_check_nvgemm(compiled_fn, bias, a, b)
+                    if index == 0
+                    else compiled_fn(bias, a, b)
+                )
                 self.assertEqual(
-                    compiled_fn(bias, a, b),
+                    actual,
                     addmm(bias, a, b),
                     atol=1e-2,
                     rtol=1.6e-2,
@@ -6705,15 +6716,21 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         counters.clear()
 
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled_fn = torch.compile(bmm, dynamic=True)
-            for batch, m, n, k in (
+            compiled_fn = torch.compile(bmm, dynamic=True, fullgraph=True)
+            shapes = (
                 (2, 64, 128, 256),
                 (4, 128, 256, 512),
                 (2, 64, 128, 256),
-            ):
+            )
+            for index, (batch, m, n, k) in enumerate(shapes):
                 a = torch.randn(batch, m, k, dtype=torch.bfloat16, device=device)
                 b = torch.randn(batch, k, n, dtype=torch.bfloat16, device=device)
-                self.assertEqual(compiled_fn(a, b), bmm(a, b))
+                actual = (
+                    self._run_and_check_nvgemm(compiled_fn, a, b)
+                    if index == 0
+                    else compiled_fn(a, b)
+                )
+                self.assertEqual(actual, bmm(a, b))
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
     def test_dynamic_scaled_mm(self, device):
@@ -6721,17 +6738,23 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         counters.clear()
 
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled_fn = torch.compile(_nvfp4_scaled_mm, dynamic=True)
-            for m, n, k in (
+            compiled_fn = torch.compile(_nvfp4_scaled_mm, dynamic=True, fullgraph=True)
+            shapes = (
                 (128, 384, 512),
                 (512, 384, 512),
                 (128, 640, 512),
                 (128, 384, 1024),
                 (128, 384, 512),
-            ):
+            )
+            for index, (m, n, k) in enumerate(shapes):
                 inputs = _make_nvfp4_scaled_mm_inputs(m, n, k, device=device)
+                actual = (
+                    self._run_and_check_nvgemm(compiled_fn, *inputs)
+                    if index == 0
+                    else compiled_fn(*inputs)
+                )
                 self.assertEqual(
-                    compiled_fn(*inputs),
+                    actual,
                     _nvfp4_scaled_mm(*inputs),
                     equal_nan=True,
                 )
@@ -6751,8 +6774,8 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         counters.clear()
 
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled_fn = torch.compile(scaled_mm, dynamic=True)
-            for m, n, k in (
+            compiled_fn = torch.compile(scaled_mm, dynamic=True, fullgraph=True)
+            shapes = (
                 (128, 384, 512),
                 (128, 384, 128),
                 (128, 384, 256),
@@ -6760,7 +6783,8 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
                 (128, 640, 512),
                 (128, 384, 1024),
                 (128, 384, 512),
-            ):
+            )
+            for index, (m, n, k) in enumerate(shapes):
                 a = torch.randint(-1, 2, (m, k), device=device).to(torch.float8_e4m3fn)
                 b = (
                     torch.randint(-1, 2, (n, k), device=device)
@@ -6770,8 +6794,14 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
                 scale_k = _prep_k(k, 32)
                 scale_a = torch.rand(m, scale_k, device=device).to(torch.float8_e8m0fnu)
                 scale_b = torch.rand(scale_k, n, device=device).to(torch.float8_e8m0fnu)
+                args = a, b, scale_a, scale_b
+                actual = (
+                    self._run_and_check_nvgemm(compiled_fn, *args)
+                    if index == 0
+                    else compiled_fn(*args)
+                )
                 self.assertEqual(
-                    compiled_fn(a, b, scale_a, scale_b),
+                    actual,
                     scaled_mm(a, b, scale_a, scale_b),
                 )
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
@@ -6784,13 +6814,13 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         counters.clear()
 
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled_fn = torch.compile(grouped_mm, dynamic=True)
+            compiled_fn = torch.compile(grouped_mm, dynamic=True, fullgraph=True)
             cases = (
                 ((64, 64), 256, 512),
                 ((32, 96, 128, 128), 128, 256),
                 ((64, 64), 256, 512),
             )
-            for group_ms, n, k in cases:
+            for index, (group_ms, n, k) in enumerate(cases):
                 g = len(group_ms)
                 total_m = sum(group_ms)
                 a = torch.randn(total_m, k, dtype=torch.bfloat16, device=device)
@@ -6802,23 +6832,62 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
                     dtype=torch.int32,
                     device=device,
                 )
-                self.assertEqual(compiled_fn(a, b, offsets), grouped_mm(a, b, offsets))
+                actual = (
+                    self._run_and_check_nvgemm(compiled_fn, a, b, offsets)
+                    if index == 0
+                    else compiled_fn(a, b, offsets)
+                )
+                self.assertEqual(actual, grouped_mm(a, b, offsets))
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+    @parametrize("dynamic", (False, True))
+    def test_grouped_computed_offset_view(self, device, dynamic):
+        def fn(a, b, base_offsets):
+            offsets = (base_offsets + 1)[1:]
+            return torch._grouped_mm(a, b, offs=offsets)
+
+        torch._dynamo.reset()
+        counters.clear()
+        cases = ((64, 384), (32, 512), (64, 384))
+        with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
+            compiled = torch.compile(fn, dynamic=dynamic, fullgraph=True)
+            for index, (first_m, n) in enumerate(cases):
+                a = torch.randn(128, 256, device=device, dtype=torch.bfloat16)
+                b = torch.randn(2, n, 256, device=device, dtype=a.dtype).transpose(
+                    -1, -2
+                )
+                base_offsets = torch.tensor(
+                    [-1, first_m - 1, 127], device=device, dtype=torch.int32
+                )
+                args = a, b, base_offsets
+                actual = (
+                    self._run_and_check_nvgemm(compiled, *args)
+                    if index == 0
+                    else compiled(*args)
+                )
+                offsets = (base_offsets + 1)[1:]
+                self.assertEqual(offsets.data_ptr() % 16, 4)
+                self.assertEqual(actual, torch._grouped_mm(a, b, offs=offsets))
+        if dynamic:
+            self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
     @parametrize("dynamic", (False, True))
     @parametrize("scale_layout", ("flat", "2d"))
     def test_fp4_logical_divisibility(self, device, dynamic, scale_layout):
         torch._dynamo.reset()
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled = torch.compile(_nvfp4_scaled_mm, dynamic=dynamic)
-            for k in (96, 128):
+            compiled = torch.compile(_nvfp4_scaled_mm, dynamic=dynamic, fullgraph=True)
+            for index, k in enumerate((64, 96, 128, 64)):
                 args = _make_nvfp4_scaled_mm_inputs(128, 128, k, device=device)
                 if scale_layout == "2d":
                     a, b, sa, sb = args
                     args = a, b, sa.view(128, -1), sb.view(128, -1)
-                self.assertEqual(
-                    compiled(*args), _nvfp4_scaled_mm(*args), equal_nan=True
+                actual = (
+                    self._run_and_check_nvgemm(compiled, *args)
+                    if index == 0
+                    else compiled(*args)
                 )
+                self.assertEqual(actual, _nvfp4_scaled_mm(*args), equal_nan=True)
             args = _make_nvfp4_scaled_mm_inputs(128, 128, 96, device=device)
             bad = torch.randint(0, 256, (128, 62), device=device, dtype=torch.uint8)
             bad = bad.view(torch.float4_e2m1fn_x2)[:, :48]
@@ -6848,7 +6917,7 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
             with self.assertRaisesRegex(
                 Exception, "NoValidChoicesError|no valid choice"
             ):
-                torch.compile(fn, dynamic=True)(a, b, sa, sb, offsets)
+                torch.compile(fn, dynamic=True, fullgraph=True)(a, b, sa, sb, offsets)
 
     @parametrize("dynamic", (False, True))
     @parametrize("k", (128, 256))
@@ -6859,8 +6928,8 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         torch._dynamo.reset()
         counters.clear()
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled = torch.compile(fn, dynamic=dynamic)
-            for m in (384, 512, 384, 384):
+            compiled = torch.compile(fn, dynamic=dynamic, fullgraph=True)
+            for index, m in enumerate((384, 512, 384, 384)):
                 n = 640
                 a = torch.randint(-1, 2, (m, k), device=device).to(torch.float8_e4m3fn)
                 b = (
@@ -6869,9 +6938,19 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
                     .T
                 )
                 scale_k = _prep_k(k, 32)
-                sa = torch.ones(m, scale_k, device=device).to(torch.float8_e8m0fnu)
-                sb = torch.ones(scale_k, n, device=device).to(torch.float8_e8m0fnu)
-                self.assertEqual(compiled(a, b, sa, sb), fn(a, b, sa, sb))
+                sa = (
+                    torch.randint(1, 3, (m, scale_k), device=device) * 2 ** (index % 2)
+                ).to(torch.float8_e8m0fnu)
+                sb = (
+                    torch.randint(1, 3, (scale_k, n), device=device) * 4 ** (index // 2)
+                ).to(torch.float8_e8m0fnu)
+                args = a, b, sa, sb
+                actual = (
+                    self._run_and_check_nvgemm(compiled, *args)
+                    if index == 0
+                    else compiled(*args)
+                )
+                self.assertEqual(actual, fn(*args))
         if dynamic:
             self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
@@ -6885,7 +6964,7 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
         a = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
         b = torch.randn(256, 128, device=device, dtype=torch.bfloat16)
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled = torch.compile(fn, dynamic=True)
+            compiled = torch.compile(fn, dynamic=True, fullgraph=True)
             for value in (264, 262, 264) if layout == "pitch" else (8, 9, 8):
                 if layout == "pitch":
                     bias = torch.randn(64, value, device=device, dtype=a.dtype)[:, :128]
@@ -6927,7 +7006,7 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
 
         torch._dynamo.reset()
         with config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)):
-            compiled = torch.compile(fn, dynamic=True)
+            compiled = torch.compile(fn, dynamic=True, fullgraph=True)
             args = inputs(True)
             self.assertEqual(compiled(*args), fn(*args))
             with self.assertRaisesRegex(
@@ -6957,7 +7036,7 @@ class TestNVUniversalGemmDynamicOperators(TestCase):
             config.patch(_nvgemm_config(nvgemm_max_profiling_configs=2)),
             _force_nvgemm_choice(narrow),
         ):
-            compiled = torch.compile(fn, dynamic=True)
+            compiled = torch.compile(fn, dynamic=True, fullgraph=True)
             code = None
             for n in (32, 16, 64, 32):
                 a = torch.randint(-1, 2, (128, 256), device=device).to(
