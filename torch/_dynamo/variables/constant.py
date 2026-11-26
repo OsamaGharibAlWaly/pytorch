@@ -701,13 +701,24 @@ class FakeIdVariable(VariableTracker):
         self.value = value
         self.kind = kind
 
-    @staticmethod
-    def _create(value: int, kind: FakeValueKind = FakeValueKind.ID) -> FakeIdVariable:
+    def _create(self, value: int, kind: FakeValueKind | None = None) -> FakeIdVariable:
         from .builder import SourcelessBuilder
 
-        return SourcelessBuilder.create_internal_fake_id(value, kind)
+        return SourcelessBuilder.create_internal_fake_id(value, kind or self.kind)
 
     def as_python_constant(self) -> int:
+        if self.kind is FakeValueKind.HASH:
+            return super().as_python_constant()
+        return self.value
+
+    def guard_as_python_constant(self) -> int:
+        if self.kind is FakeValueKind.HASH:
+            unimplemented(
+                gb_type="Conversion of compile-time-only hash value",
+                context="identity-dependent hash",
+                explanation="An identity-dependent hash cannot be converted to a constant result.",
+                hints=["Compute the hash outside the compiled function."],
+            )
         return self.value
 
     def is_python_constant(self) -> bool:
@@ -720,16 +731,17 @@ class FakeIdVariable(VariableTracker):
         return hash(self.value), True
 
     def tp_repr_impl(self, tx: InstructionTranslatorBase) -> VariableTracker:
+        # Only ID values reach this conversion. HASH values refuse it.
         # Mirrors int.__repr__: the value is an int, so str()/repr() yield its
         # decimal string. The distinct-but-compile-time-only identity carried by
         # the fake id is preserved in the resulting string, matching how
         # FakeIdVariable already resolves same-kind id()/hash() comparisons.
-        return ConstantVariable.create(repr(self.value))
+        return ConstantVariable.create(repr(self.guard_as_python_constant()))
 
     def nb_bool_impl(self, tx: InstructionTranslatorBase) -> VariableTracker:
         # Mirrors long_bool. The fake value is only meaningful at compile time,
         # but its truthiness is, like tp_repr_impl, a plain function of it.
-        return ConstantVariable.create(bool(self.value))
+        return ConstantVariable.create(bool(self.guard_as_python_constant()))
 
     def tp_richcompare_impl(
         self, tx: InstructionTranslatorBase, other: VariableTracker, op: str
@@ -785,6 +797,8 @@ class FakeIdVariable(VariableTracker):
             result = op(lhs, rhs)
         except (TypeError, ValueError, OverflowError, ZeroDivisionError) as e:
             raise_observed_exception(type(e), tx, args=list(e.args))
+        if isinstance(other, FakeIdVariable) and other.kind is FakeValueKind.HASH:
+            return self._create(result, other.kind)
         return self._create(result)
 
     def nb_add_impl(self, tx, other, reverse=False):  # type: ignore[no-untyped-def]
@@ -836,6 +850,7 @@ class FakeIdVariable(VariableTracker):
         return self._create(self.value, kind=self.kind)
 
     def reconstruct(self, codegen: Any) -> None:
+        self.guard_as_python_constant()
         unimplemented(
             gb_type="Reconstruction of FakeIdVariable",
             context=str(self.value),
