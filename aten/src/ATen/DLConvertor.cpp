@@ -146,7 +146,15 @@ DLDevice torchDeviceToDLDevice(at::Device device) {
       break;
     case DeviceType::PrivateUse1:
       if (isPrivateUse1HooksRegistered()) {
-        return detail::getPrivateUse1Hooks().getDLDevice(device.index());
+        const auto& hooks = detail::getPrivateUse1Hooks();
+        ctx.device_type = static_cast<DLDeviceType>(hooks.getDLDeviceType());
+        const auto index =
+            device.has_index() ? device.index() : hooks.getCurrentDevice();
+        ctx.device_id = static_cast<unsigned char>(index);
+        TORCH_CHECK_BUFFER(
+            dlDeviceToTorchDevice(ctx.device_type, index).is_privateuseone(),
+            "PrivateUse1 DLPack type override must map to PrivateUse1");
+        return ctx;
       }
       ctx.device_type = DLDeviceType::kDLExtDev;
       break;
@@ -193,6 +201,13 @@ Device dlDeviceToTorchDevice(
     case DLDeviceType::kDLMetal:
       return at::Device(DeviceType::MPS, index);
     default:
+      // ROCm builds omit the kDLCUDA case above, so it reaches this fallback.
+      // Keep rejecting it: from_dlpack routes kDLCUDA stream handling through
+      // torch.cuda and cannot dispatch it to a PrivateUse1 backend.
+      if (type != DLDeviceType::kDLCUDA && isPrivateUse1HooksRegistered() &&
+          detail::getPrivateUse1Hooks().getDLDeviceType() == type) {
+        return Device(kPrivateUse1, index);
+      }
       TORCH_CHECK_BUFFER(
           false, "Unsupported device_type: ", std::to_string(type));
   }
