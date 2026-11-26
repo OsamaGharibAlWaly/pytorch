@@ -21,6 +21,7 @@ import functools
 import inspect
 import logging
 import operator
+import sys
 import textwrap
 from collections.abc import Callable, ItemsView, KeysView, ValuesView
 from contextvars import ContextVar
@@ -341,9 +342,8 @@ class MethodFlags(IntFlag):
 
 
 def _check_method_arity(
-    vt: VariableTracker,
     tx: InstructionTranslatorBase,
-    name: str,
+    qualname: str,
     flags: MethodFlags,
     args: Any,
     kwargs: Any,
@@ -352,7 +352,6 @@ def _check_method_arity(
     # raising the same TypeErrors CPython raises for builtin methods. Shared by
     # Method and callers that run the handler directly (e.g. tensor.py).
     n = len(args)
-    qualname = f"{vt.python_type_name()}.{name}"
     if kwargs and not (flags & MethodFlags.KEYWORDS):
         raise_type_error(tx, f"{qualname}() takes no keyword arguments")
     if flags & (MethodFlags.NOARGS | MethodFlags.O):
@@ -428,7 +427,7 @@ class Method:
         kwargs: Any,
     ) -> VariableTracker | None:
         flags = _derive_method_flags(vt, name)
-        _check_method_arity(vt, tx, name, flags, args, kwargs)
+        _check_method_arity(tx, f"{vt.python_type_name()}.{name}", flags, args, kwargs)
         return self.handler(vt, tx, args, kwargs)
 
 
@@ -695,9 +694,11 @@ def _wrap_binaryfunc(
     func: Callable[..., VariableTracker],
     args: list[VariableTracker],
     kwargs: dict[str, VariableTracker],
+    *,
+    name: str = "this method",
 ) -> VariableTracker:
     if kwargs:
-        raise_type_error(tx, "this method takes no keyword arguments")
+        raise_type_error(tx, f"{name} takes no keyword arguments")
     check_num_args(tx, args, 1)
     other = args[0]
     return func(self, tx, other)
@@ -709,10 +710,12 @@ def _wrap_binaryfunc_r(
     func: Callable[..., VariableTracker],
     args: list[VariableTracker],
     kwargs: dict[str, VariableTracker],
+    *,
+    name: str = "this method",
 ) -> VariableTracker:
     # Reflected binary op (``__radd__``): same impl, operands from the right.
     if kwargs:
-        raise_type_error(tx, "this method takes no keyword arguments")
+        raise_type_error(tx, f"{name} takes no keyword arguments")
     check_num_args(tx, args, 1)
     other = args[0]
     return func(self, tx, other, reverse=True)
@@ -809,8 +812,10 @@ def _wrap_objobjargproc(
     kwargs: dict[str, VariableTracker],
 ) -> VariableTracker:
     if kwargs:
-        raise_type_error(tx, "this method takes no keyword arguments")
-    check_positional(tx, "", len(args), 2, 2)
+        raise_type_error(tx, "wrapper __setitem__() takes no keyword arguments")
+    # CPython gh-123446 added the slot name to PyArg_UnpackTuple in 3.14.
+    name = "__setitem__" if sys.version_info >= (3, 14) else ""
+    check_positional(tx, name, len(args), 2, 2)
     [key, value] = args
     return func(self, tx, key, value)
 
@@ -823,7 +828,7 @@ def _wrap_delitem(
     kwargs: dict[str, VariableTracker],
 ) -> VariableTracker:
     if kwargs:
-        raise_type_error(tx, "this method takes no keyword arguments")
+        raise_type_error(tx, "wrapper __delitem__() takes no keyword arguments")
     check_num_args(tx, args, 1)
     [key] = args
     return func(self, tx, key, None)
@@ -1256,6 +1261,8 @@ def MPSLOT(name: str, impl: str, slot: int, wrapper: WrapperType) -> SlotDef:
 
 
 def NBSLOT(name: str, impl: str, slot: int, wrapper: WrapperType) -> SlotDef:
+    if wrapper in (_wrap_binaryfunc, _wrap_binaryfunc_r):
+        wrapper = functools.partial(wrapper, name=f"wrapper {name}()")
     return SlotDef(name, impl, SlotGroup.NUMBER, slot, wrapper)
 
 
