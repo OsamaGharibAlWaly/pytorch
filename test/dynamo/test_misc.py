@@ -5459,29 +5459,71 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
 
     def test_deepcopy_ordered_dict(self):
         def minimal(x):
-            copy.deepcopy(collections.OrderedDict(a=1))
-            return x + 1
+            od = collections.OrderedDict(a=1)
+            copy.deepcopy(od)
+            od.__dict__["tag"] = x + 1
+            return od.tag
 
         x = torch.randn(4)
         self.assertEqual(
             torch.compile(minimal, fullgraph=True, backend="eager")(x), minimal(x)
         )
 
-    @parametrize("copier", [copy.copy, copy.deepcopy])
+    @parametrize("nested", [False, True])
+    def test_deepcopy_ordered_dict_memo(self, nested):
+        class Obj:
+            def __deepcopy__(self, memo):
+                memo[id(self)] = ()
+                return () if nested else self
+
+        def region(x, m):
+            copied = copy.deepcopy(m, None if nested else {id(Obj()): None})
+            return x + len(copied) + (copied["a"] is m["a"])
+
+        run = torch.compiler.nested_compile_region(region) if nested else region
+        fn = torch.compile(lambda x, m: run(x, m), backend="eager", fullgraph=True)
+        m = collections.OrderedDict(a=Obj(), b=[Obj()], c={"k": Obj()}, d=([],), e={1})
+        self.assertEqual(fn(torch.tensor(1), m), 1 + len(m) + (not nested))
+        if nested:
+            report = torch._dynamo.explain(region)(torch.tensor(1), m)
+            self.assertEqual(report.graph_break_count, 0)
+            names = [g.create_fn_name() for g in report.out_guards]
+            self.assertNotIn("DEEPCOPY_MEMO_CONTAINS_ID", names)
+
+    @unittest.skipUnless(hasattr(copy, "_deepcopy_atomic"), "requires legacy deepcopy")
+    def test_deepcopy_ordered_dict_memo_export(self):
+        class Obj:
+            def __deepcopy__(self, memo):
+                memo[self.key_id] = ()
+                return ()
+
+        m = collections.OrderedDict(a=Obj(), b=0)
+        m["a"].key_id = id(next(reversed(m)))
+        export = torch._dynamo.export(lambda x, m: x + len(copy.deepcopy(m)))
+        with self.assertRaisesRegex(Unsupported, "memo may already contain"):
+            export(torch.ones(1), m)
+
+    @parametrize(
+        "copier", [copy.copy, copy.deepcopy, lambda od: copy.deepcopy([od], {17: 3})[0]]
+    )
     def test_ordered_dict_copy_input_order(self, copier):
         def fn(x, od):
-            return x + (next(iter(copier(od))) == "first key")
+            result = copier(od)
+            return x + (next(reversed(result)) == "first key"), next(iter(result))
 
         counter = CompileCounter()
         compiled = torch.compile(fn, backend=counter, fullgraph=True)
         x = torch.tensor(10)
         original = collections.OrderedDict.fromkeys(["".join(["first", " key"]), "b"])
+        original["b"] = value = [1]
         equal_key = "".join(["first", " key"])
         self.assertIsNot(next(iter(original)), equal_key)
         self.assertEqual(compiled(x, original), fn(x, original))
         original.clear()
-        original.update([(equal_key, None), ("b", None)])
-        self.assertEqual(compiled(x, original), fn(x, original))
+        original.update([(equal_key, None), ("b", value)])
+        result = compiled(x, original)
+        self.assertEqual(result, fn(x, original))
+        self.assertIs(result[1], equal_key)
         self.assertEqual(counter.frame_count, 1)
         reversed_input = collections.OrderedDict(reversed(list(original.items())))
         self.assertEqual(compiled(x, reversed_input), fn(x, reversed_input))
@@ -5498,22 +5540,58 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
         od = collections.OrderedDict(a=1)
         self.assertEqual(vars(compiled(x, od)[1]), {})
         od.tag = [42]
+        with self.assertRaisesRegex(Unsupported, r"OrderedDict\.__deepcopy__"):
+            torch.compile(hasattr, backend="eager", fullgraph=True)(od, "__deepcopy__")
         copied = compiled(x, od)[1]
         self.assertEqual(vars(copied), vars(od))
         self.assertEqual(copied.tag is od.tag, copier is copy.copy)
 
     @parametrize("copier", [copy.copy, copy.deepcopy])
-    def test_ordered_dict_copy_after_instance_dict_write(self, copier):
+    @parametrize("via_dict", [False, True])
+    @parametrize("local", [False, True])
+    def test_ordered_dict_copy_after_instance_dict_write(self, copier, via_dict, local):
         def fn(x, od):
-            od.__dict__["tag"] = [42]
-            return x + 1, od, copier(od)
+            view, od, copied = copy_with_state(od)
+            return x + next(iter(view)), od, copied
 
+        def copy_with_state(inp):
+            od = collections.OrderedDict(a=1) if local else inp
+            view = od.values()
+            if via_dict:
+                od.__dict__["tag"] = value
+            else:
+                od.tag = value
+            return view, od, copier(od)
+
+        value = [42]
         x = torch.tensor(10)
         inp = collections.OrderedDict(a=1)
-        result, od, copied = torch.compile(fn, backend="eager")(x, inp)
+        if local:
+            with self.assertRaisesRegex(Unsupported, r"OrderedDict\.__reduce_ex__"):
+                torch.compile(fn, backend="eager", fullgraph=True)(x, inp)
+        counter = CompileCounter()
+        compiled = torch.compile(fn, backend=counter)
+        result, od, copied = compiled(x, inp)
         self.assertEqual(result, x + 1)
         self.assertEqual(copied.tag, [42])
         self.assertEqual(copied.tag is od.tag, copier is copy.copy)
+        self.assertIs(od.tag, value)
+        self.assertEqual(od is inp, not local)
+        compiled(x, collections.OrderedDict(a=1))
+        self.assertEqual(counter.frame_count, 1)
+
+    def test_return_ordered_dict_with_instance_state(self):
+        def fn(x):
+            value = collections.OrderedDict(a=x)
+            value.__dict__["tag"] = x
+            return value, value.tag
+
+        x = torch.ones(1)
+        with self.assertRaisesRegex(Unsupported, "returning a local OrderedDict"):
+            torch.compile(fn, backend="eager", fullgraph=True)(x)
+        value, tag = torch.compile(fn, backend="eager")(x)
+        self.assertIs(value["a"], x)
+        self.assertIs(value.tag, tag)
 
     @parametrize("copier", [copy.copy, copy.deepcopy])
     def test_ordered_dict_copy_after_possible_instance_dict_alias_write(self, copier):
