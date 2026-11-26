@@ -997,15 +997,18 @@ def nested_compile_region(
             Inductor config keys {supported_config_keys}.
             Warning: this is an experimental feature under development and
             not ready for use yet.
-        max_reuse_entries: Maximum number of reuse cache entries per function
+        max_reuse_entries: Maximum number of entries in an automatic reuse cache
             before raising an error. If this limit is hit, guards keep failing
             across invocations and hierarchical compilation is not effective.
+            Automatic reuse shares this budget by code object unless a closure,
+            defaults or foreign globals require a separate function-identity cache.
         reuse_hash_fn: Optional callable that takes the same ``*args, **kwargs``
             as the wrapped function and returns an integer hash key. When
             provided, Dynamo traces this function to obtain a constant integer
             and uses it as the cache key for subgraph reuse, bypassing the
-            automatic fingerprint/guard machinery. Two calls that produce the
-            same hash key reuse the same cached subgraph. The hash function
+            automatic fingerprint/guard machinery. Calls with the same code object
+            and hash key share a subgraph. Include relevant defaults, globals,
+            closures and aliases in the key. The hash function
             must be fully traceable (no graph breaks) and must return a
             constant integer.
     """
